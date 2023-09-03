@@ -1,36 +1,44 @@
 const express = require('express');
+const { compareSync, hashSync } = require('bcrypt'); 
 const cors = require('cors');
 const { initializeApp } = require('firebase/app');
-const { getFirestore, collection, getDocs, addDoc, updateDoc, arrayUnion } = require('firebase/firestore');
+const uuidv4 = require('uuid').v4;
+const { getFirestore, collection, getDocs, addDoc, updateDoc, arrayUnion, query, where, deleteDoc } = require('firebase/firestore');
+const { getDoc, doc } = require('firebase/firestore');
 const jwt = require('jsonwebtoken');
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+const corsOptions = {
+  origin: 'https://compete-ce97a.web.app',
+};
+// Initialize the Firebase Admin SDK
+admin.initializeApp();
 require('dotenv').config();
 const secretKey = process.env.JWT_SECRET_KEY;
 // Create firestorep authentication object
 const firebaseConfig = {
-  apiKey: process.env.FIREBASE_API_KEY,
-  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.FIREBASE_PROJECT_ID,
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.FIREBASE_APP_ID,
-  measurementId: process.env.FIREBASE_MEASUREMENT_ID,
+  apiKey: process.env.COMPETE_FIREBASE_API_KEY,
+  authDomain: process.env.COMPETE_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.COMPETE_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.COMPETE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.COMPETE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.COMPETE_FIREBASE_APP_ID,
+  measurementId: process.env.COMPETE_FIREBASE_MEASUREMENT_ID,
 };
 
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp);
 const app = express();
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
-app.use(upload);
 app.get('/profile/:username', async (req, res) => {
   try {
     const username = req.params.username; // Access the user ID from the URL parameter
     // Query the database to retrieve user data based on the user ID
-    const usersRef = collection(db, 'user_accounts');
+    const usersRef = collection(db, 'userAccounts');
     const querySnapshot = await getDocs(usersRef);
     const user = querySnapshot.docs.find((doc) => doc.data().username.toLowerCase() === username.toLowerCase());
-    if (result.rows.length === 1) {
-      const user = result.rows[0];
+    if (user) {
       // Return the user data as the response
       res.json(user);
     } else {
@@ -49,15 +57,17 @@ app.get('/:name/:id', async (req, res) => {
     const id = req.params.id; // Access the user ID from the URL parameter
     const lowerName = decodedName.toLowerCase();
 
-    // Create a Firestore query to retrieve competitions where user_id is equal to id
-    // or where the participants array contains an object with the given username
+    // Fetch all competitions from Firestore
     const competitionsRef = collection(db, 'competitions');
-    const q = query(competitionsRef, where('user_id', '==', id), where('participants', 'array-contains', { name: lowerName }));
-
-    const querySnapshot = await getDocs(q);
+    const querySnapshot = await getDocs(competitionsRef);
+    
+    // Filter competitions based on userId or participants
     const competitions = [];
     querySnapshot.forEach((doc) => {
-      competitions.push(doc.data());
+      const competitionData = doc.data();
+      if (competitionData.userId === id || competitionData.participants.some(participant => participant.name.toLowerCase() === lowerName)) {
+        competitions.push({ ...competitionData, id: doc.id }); // Include id property in the response
+      }
     });
 
     if (competitions.length > 0) {
@@ -75,42 +85,46 @@ app.get('/:name/:id', async (req, res) => {
 // Define POST request to post user account data to postgreSQL table
 app.post('/post_user', async (req, res) => {
   try {
-    const { username, email, password, first_name, last_name, phoneNumber } = req.body;
+    const { username, email, password, firstName, lastName, phoneNumber } = req.body;
     const lowerUsername = username.toLowerCase(); // Convert username to lowercase
     const lowerEmail = email.toLowerCase(); // Convert email to lowercase
+    const userId = uuidv4();
 
     // Check if the username or email already exists in the database
-    const usersRef = collection(db, 'user_accounts');
+    const usersRef = collection(db, 'userAccounts');
     const usernameQuery = query(usersRef, where('username', '==', lowerUsername));
     const emailQuery = query(usersRef, where('email', '==', lowerEmail));
+    const phoneQuery = query(usersRef, where('phoneNumber', '==', phoneNumber));
 
-    const [usernameSnapshot, emailSnapshot] = await Promise.all([
+    const [usernameSnapshot, emailSnapshot, phoneSnapshot] = await Promise.all([
       getDocs(usernameQuery),
-      getDocs(emailQuery)
+      getDocs(emailQuery),
+      getDocs(phoneQuery)
     ]);
 
-    if (!usernameSnapshot.empty || !emailSnapshot.empty) {
+    if (!usernameSnapshot.empty || !emailSnapshot.empty || !phoneSnapshot.empty) {
       // User already exists
-      return res.status(400).json({ error: 'Username or email already registered' });
+      return res.status(400).json({ error: 'Username, email, or phone number already registered' });
     }
 
     // Insert data into the user_accounts collection
     const newUser = {
       username: lowerUsername,
       email: lowerEmail,
-      password,
-      first_name,
-      last_name,
-      phone_number: phoneNumber
+      password: hashSync(password, 10),
+      firstName,
+      lastName,
+      phoneNumber: phoneNumber,
+      userId
     };
 
-    const newUserRef = await addDoc(collection(db, 'user_accounts'), newUser);
+    const newUserRef = await addDoc(collection(db, 'userAccounts'), newUser);
 
     // Generate an authentication token (You need to handle this part according to your authentication method)
     const token = jwt.sign({username, email}, secretKey);
 
     // Send the token and other user information to the frontend
-    res.status(200).json({ token, ...newUser, user_id: newUserRef.id });
+    res.status(200).json({ token, ...newUser, userId: newUserRef.id });
   } catch (err) {
     console.error('Error executing query', err);
     res.status(500).json({ error: 'Server error' });
@@ -120,21 +134,21 @@ app.post('/post_user', async (req, res) => {
 // Define POST request for user login
 app.post('/login', async (req, res) => {
   try {
-    const { usernameOrEmail, password } = req.body;
-    const usernameOrEmailLower = usernameOrEmail.toLowerCase(); // Convert input to lowercase
+    const { email, password } = req.body;
+    const lowerEmail = email.toLowerCase(); // Convert input to lowercase
 
     // Query the Firestore to retrieve user account data based on the provided username/email
-    const usersRef = collection(db, 'user_accounts');
-    const query = query(usersRef, where('username', '==', usernameOrEmailLower), where('email', '==', usernameOrEmailLower));
+    const usersRef = collection(db, 'userAccounts');
+    const loginQuery = query(usersRef, where('email', '==', lowerEmail));
 
-    const querySnapshot = await getDocs(query);
+    const querySnapshot = await getDocs(loginQuery);
 
     if (!querySnapshot.empty) {
       const user = querySnapshot.docs[0].data();
 
       if (compareSync(password, user.password)) {
-        const token = sign({ username: user.username }, secretKey);
-        res.json({ token, username: user.username, user_id: user.user_id, phone_number: user.phone_number }); // Include user_id in the response
+        const token = jwt.sign({ username: user.username }, secretKey);
+        res.json({ token, username: user.username, userId: user.userId, phoneNumber: user.phoneNumber }); // Include user_id in the response
       } else {
         res.sendStatus(401); // Invalid password
       }
@@ -150,7 +164,7 @@ app.post('/login', async (req, res) => {
 app.get('/user_accounts', async (req, res) => {
   try {
     // Query the Firestore to retrieve all documents from the 'user_accounts' collection
-    const usersRef = collection(db, 'user_accounts');
+    const usersRef = collection(db, 'userAccounts');
     const querySnapshot = await getDocs(usersRef);
     
     const userAccounts = [];
@@ -175,7 +189,7 @@ app.get('/event/:competition/:id', async (req, res) => {
 
     if (eventDoc.exists()) {
       const event = eventDoc.data();
-      res.json(event);
+      res.json(event); // Include id as a property in the response JSON
     } else {
       // Event not found
       res.sendStatus(404);
@@ -200,35 +214,44 @@ app.post('/event/:competition/:id/delete', async (req, res) => {
     res.sendStatus(500);
   }
 });
-// app.post('/user/:username/profile-picture', upload, async(req, res) => {
-//   upload(req, res, async (err) => {
-//     if (err) {
-//       console.error('Error uploading file:', err);
-//       return res.sendStatus(500);
-//     }
-//     try {
-//       const username = req.params.username;
-//       const file = req.file.buffer; // Access the uploaded file using req.file
-//       console.log('req.file:', req.file);
-//       console.log('file:', file);
-//       // Query the database to update the profile picture of the user with matching username
-//       const lowerUsername = username.toLowerCase();
-//       const result = await pool.query('UPDATE user_accounts SET profile_picture = $1 WHERE LOWER(username) = $2 RETURNING *', [file, lowerUsername]);
-//       if (result.rows.length === 1) {
-//         const user = result.rows[0];
-//         user.profile_picture = file
-//         // Return the updated user data as the response
-//         res.json(user);
-//       } else {
-//         // User not found
-//         res.sendStatus(404);
-//       }
-//     } catch (error) {
-//       console.error('Error updating profile picture:', error);
-//       res.sendStatus(500);
-//     }
-//   });
-// });
+app.post('/event/:competition/:id/unregister', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { username } = req.body;
+
+    // Get the document reference for the competition
+    const competitionDoc = doc(db, 'competitions', id);
+    const competitionSnapshot = await getDoc(competitionDoc);
+
+    if (competitionSnapshot.exists()) {
+      const competitionData = competitionSnapshot.data();
+
+      // Find the index of the participant with the provided username
+      const participantIndex = competitionData.participants.findIndex(
+        (participant) => participant.username.toLowerCase() === username.toLowerCase()
+      );
+
+      if (participantIndex !== -1) {
+        // Remove the participant from the array
+        competitionData.participants.splice(participantIndex, 1);
+
+        // Update the participants array in the document
+        await updateDoc(competitionDoc, {
+          participants: competitionData.participants
+        });
+
+        res.status(200).json({ message: 'Successfully removed participant' });
+      } else {
+        res.status(400).json({ error: 'Participant not found' });
+      }
+    } else {
+      res.status(404).json({ error: 'Event not found' });
+    }
+  } catch (err) {
+    console.error('Error executing query', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 app.get('/competitions', async (req, res) => {
   try {
     // Retrieve all documents from the 'competitions' collection
@@ -252,7 +275,7 @@ app.get('/username', async (req, res) => {
     const lowerEmail = email.toLowerCase();
 
     // Retrieve the username from Firestore based on the email
-    const usersRef = collection(db, 'user_accounts');
+    const usersRef = collection(db, 'userAccounts');
     const q = query(usersRef, where('email', '==', lowerEmail));
     const querySnapshot = await getDocs(q);
 
@@ -270,21 +293,21 @@ app.get('/username', async (req, res) => {
 // Define POST request to post user account data to postgreSQL table
 app.post('/post_competitions', async (req, res) => {
   try {
-    const { user_id, title, description, organizer, location, time, date, images, categories, price } = req.body;
-
+    const { userId, title, description, organizer, location, eventTime, date, images, categories, price } = req.body;
+    const participants = []
     // Add data to the 'competitions' collection in Firestore
     const competitionsRef = collection(db, 'competitions');
     await addDoc(competitionsRef, {
-      user_id,
+      userId,
       title,
       description,
       organizer,
       location,
-      event_time: time,
-      date,
+      eventTime,
       images,
       category: categories,
-      price
+      price,
+      participants,
     });
 
     res.sendStatus(200); // Send a success response
@@ -298,9 +321,9 @@ app.post('/review', async (req, res) => {
     const { name, review, id } = req.body;
 
     // Update the 'reviews' collection in Firestore
-    const reviewDoc = doc(db, 'reviews', id);
+    const reviewDoc = doc(db, 'improvements', 'rmnb5SKwhN6zai8ZZb2B');
     await updateDoc(reviewDoc, {
-      general_reviews: arrayUnion({ name, review, id })
+      generalReviews: arrayUnion({ name, review, id })
     });
 
     res.sendStatus(200); // Send a success response
@@ -332,7 +355,7 @@ app.post('/participate/:id', async (req, res) => {
 
       // Add the user to the participants array
       await updateDoc(competitionDoc, {
-        participants: arrayUnion({ name, username, phone_number: phoneNumber })
+        participants: arrayUnion({ name, username, phoneNumber: phoneNumber })
       });
 
       res.status(200).json({ message: 'Successfully updated participants' });
@@ -344,35 +367,33 @@ app.post('/participate/:id', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-app.post('/newsletter', async (req, res) => {
+app.post('/subscribe-newsletter', async (req, res) => {
   try {
-    const { passedEmail } = req.body;
+    const email = req.body.email;
 
-    // Get the document reference for the reviews collection
-    const reviewsCollection = collection(db, 'reviews');
-    const reviewsDoc = doc(reviewsCollection, 'newsletter');
+    // Query Firestore to retrieve the document for the "newsletter" section in "improvements"
+    const newsletterRef = doc(db, 'improvements', 'HPqBQ3yqvcfnM4R6x5hP');
+    const newsletterDoc = await getDoc(newsletterRef);
 
-    // Get the current newsletter email list
-    const newsletterSnapshot = await getDoc(reviewsDoc);
-    const existingEmailList = newsletterSnapshot.data()?.newsletter_email_list || [];
+    if (newsletterDoc.exists()) {
+      const newsletterData = newsletterDoc.data();
+      const emailList = newsletterData?.newsletterEmailList || [];
+      if (emailList.includes(email)) {
+        return res.status(400).json({ error: 'Email is already subscribed' });
+      }
+      const updatedEmailList = [...emailList, email];
 
-    // Check if the user is already subscribed
-    const isAlreadySubscribed = existingEmailList.some(emailObj =>
-      emailObj.email?.toLowerCase() === passedEmail?.toLowerCase()
-    );
+      // Update the email list in the "newsletter" document
+      await updateDoc(newsletterRef, {
+        newsletterEmailList: updatedEmailList
+      });
 
-    if (isAlreadySubscribed) {
-      return res.status(400).json({ error: 'You are already subscribed!' });
+      res.status(200).json({ message: 'Email added to newsletter list' });
+    } else {
+      res.status(404).json({ error: 'Newsletter document not found' });
     }
-
-    // Update the email list in the document
-    await updateDoc(reviewsDoc, {
-      newsletter_email_list: arrayUnion({ email: passedEmail })
-    });
-
-    res.status(200).json({ message: 'Successfully updated newsletter email list' });
-  } catch (err) {
-    console.error('Error executing query', err);
+  } catch (error) {
+    console.error('Error subscribing to newsletter:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -380,3 +401,5 @@ const port = 3000
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
+
+exports.api = functions.https.onRequest(app);
